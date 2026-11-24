@@ -3,7 +3,7 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import LlmRuntime, { userAgent } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { LlmError, userAgent } from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { discoverModels } from '../src/discovery.ts'
@@ -341,6 +341,40 @@ describe('draft-provider model discovery', () => {
       .toEqual(['Bearer stored-key', 'Bearer typed', undefined, 'Bearer plain-typed'])
     expect(server.headers.map(headers => headers['x-company-code']))
       .toEqual(['private-tenant', 'private-tenant', undefined, undefined])
+  })
+
+  it('runs discovery-headers contributors before Harness attribution', async () => {
+    // A route whose endpoint needs a header produced at request time — a
+    // rotating proxy token, say — must be able to authenticate the discovery
+    // probe, not only inference. Contributors run before attribution, so the
+    // harness identity cannot be spoofed.
+    const server = await listingServer({ body: JSON.stringify({ data: [{ id: 'm' }] }) })
+    const ctx = await harness()
+    const seen: (string | undefined)[] = []
+    ctx.on('llm-pi-ai/discovery-headers', (request, headers, next) => {
+      seen.push(request.baseURL)
+      headers.set('x-probe-token', 'rotating')
+      headers.set('user-agent', 'spoofed')
+      return next()
+    })
+
+    await ctx.llm.discoverModels('llm-pi-ai', { baseURL: server.url, apiKey: 'probe-key' })
+
+    expect(seen).toEqual([server.url])
+    expect(server.headers[0]?.['x-probe-token']).toBe('rotating')
+    expect(server.headers[0]?.['user-agent']).toBe(userAgent())
+  })
+
+  it('keeps an LlmError thrown by a discovery-headers contributor', async () => {
+    const server = await listingServer({ body: JSON.stringify({ data: [{ id: 'm' }] }) })
+    const ctx = await harness()
+    ctx.on('llm-pi-ai/discovery-headers', () => {
+      throw new LlmError('rotating token unavailable', 'REQUEST_HEADERS')
+    })
+
+    await expect(ctx.llm.discoverModels('llm-pi-ai', { baseURL: server.url }))
+      .rejects.toMatchObject({ code: 'REQUEST_HEADERS' })
+    expect(server.paths).toEqual([])
   })
 
   it('leaves a catalog route\'s credential unresolved, having never reached the network', async () => {

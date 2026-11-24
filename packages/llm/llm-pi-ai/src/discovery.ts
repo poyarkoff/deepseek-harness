@@ -316,6 +316,10 @@ export interface StoredModelDiscoveryProfile {
  * @param storedProfile - Host-owned headers and lazy credential resolution for
  *   the named route. It is read only on the path that reaches the network; the
  *   credential is resolved only when the draft carries none.
+ * @param prepareHeaders - optional synchronous contributor for this exact
+ *   listing request. It receives the headers derived from the stored profile and
+ *   the one-shot credential, and returns the headers to send; Harness
+ *   attribution is applied afterward.
  * @returns the advertised models in endpoint order.
  * @throws LlmError when the protocol has no readable listing, the endpoint
  *   refuses or fails the request, or the reply is not a model listing.
@@ -323,6 +327,7 @@ export interface StoredModelDiscoveryProfile {
 export async function discoverModels(
   request: LlmModelDiscoveryOperation,
   storedProfile?: () => StoredModelDiscoveryProfile | undefined,
+  prepareHeaders?: (request: LlmModelDiscoveryOperation, headers: Headers) => Headers,
 ): Promise<readonly LlmDiscoveredModel[]> {
   // A catalog route already has its answer, and a better one: the installed
   // entries carry context windows and output caps no listing endpoint reports.
@@ -379,16 +384,22 @@ export async function discoverModels(
     } else if (apiKey !== undefined) {
       headers.set('authorization', `Bearer ${apiKey}`)
     }
-    for (const [name, value] of Object.entries(attributionHeaders())) headers.set(name, value)
+    // Contributors run before Harness attribution, exactly as they do for an
+    // inference call, so attribution always wins and no plugin can spoof it.
+    const prepared = prepareHeaders === undefined ? headers : prepareHeaders(request, headers)
+    for (const [name, value] of Object.entries(attributionHeaders())) prepared.set(name, value)
     response = await fetch(url, {
       method: 'GET',
-      headers,
+      headers: prepared,
       ...request.signal === undefined ? {} : { signal: request.signal },
     })
   } catch (error: unknown) {
     if (request.signal?.aborted) {
       throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
     }
+    // A contributor's own coded failure keeps its code; only transport errors
+    // are reported as an unreachable endpoint.
+    if (error instanceof LlmError) throw error
     throw new LlmError(`could not reach ${url}`, 'DISCOVERY_FAILED', { cause: error })
   }
   if (!response.ok) {
